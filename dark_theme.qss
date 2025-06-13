@@ -1,0 +1,96 @@
+/* dark_theme.qss */
+QWidget {
+    background-color: #2e2e2e; /* Dark gray background */
+    color: #e0e0e0;            /* Light gray text */
+    font-size: 10pt;           /* Or your preferred font size */
+}
+
+QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+    background-color: #3c3c3c; /* Slightly lighter gray for inputs */
+    color: #e0e0e0;
+    border: 1px solid #555555;
+    border-radius: 3px;
+    padding: 3px;
+}
+
+QComboBox::drop-down {
+    border: none;
+}
+
+QComboBox::down-arrow {
+    image: url(none); /* Or path to a custom arrow icon */
+}
+
+
+QPushButton {
+    background-color: #555555;
+    color: #e0e0e0;
+    border: 1px solid #666666;
+    padding: 5px;
+    border-radius: 3px;
+}
+
+QPushButton:hover {
+    background-color: #6a6a6a;
+}
+
+QPushButton:pressed {
+    background-color: #4a4a4a;
+}
+
+QGroupBox {
+    border: 1px solid #4a4a4a;
+    border-radius: 5px;
+    margin-top: 10px; /* Space for the title */
+    font-weight: bold;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 5px 0 5px;
+    left: 10px; /* Position title slightly indented */
+}
+
+QLabel {
+    /* color: #e0e0e0; */ /* Inherits from QWidget */
+}
+
+QProgressBar {
+    border: 1px solid #555555;
+    border-radius: 3px;
+    text-align: center;
+    background-color: #3c3c3c;
+    color: #e0e0e0;
+}
+
+QProgressBar::chunk {
+    background-color: #0078d4; /* A contrasting color for progress */
+    border-radius: 2px;
+}
+
+QListWidget {
+    background-color: #3c3c3c;
+    border: 1px solid #555555;
+}
+
+/* You'll need to style scrollbars, table views, etc. if you use them */
+QScrollBar:vertical {
+    border: 1px solid #555555;
+    background: #3c3c3c;
+    width: 12px;
+    margin: 12px 0 12px 0;
+}
+QScrollBar::handle:vertical {
+    background: #6a6a6a;
+    min-height: 20px;
+    border-radius: 5px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    border: none;
+    background: none;
+    height: 12px;
+    subcontrol-position: top;
+    subcontrol-origin: margin;
+}
+/* Add similar for QScrollBar:horizontal */
