@@ -8,12 +8,15 @@ import subprocess
 import shlex
 import time
 import os
-
+import psutil
+import pyqtgraph as pg # For plotting
+import monitoring_engine # NEW IMPORT
+from PyQt6.QtCore import QTimer # For periodic updates
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-                             QPushButton, QLabel, QLineEdit, QFileDialog,
+                             QPushButton, QLabel, QLineEdit, QFileDialog,QDialog,
                              QComboBox, QProgressBar, QTextEdit, QListWidget, QTreeWidget,
-                             QTreeWidgetItem,  # Added QTreeWidget, QTreeWidgetItem
-                             QSpinBox, QDoubleSpinBox, QGroupBox, QSizePolicy)
+                             QTreeWidgetItem, QCheckBox, QSplitter, QSpinBox, QDoubleSpinBox, QGroupBox, QSizePolicy, QHeaderView)
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QSettings
 
 # Assuming timelapse_engine.py is in the same directory or Python path
@@ -43,30 +46,52 @@ class FFmpegWorker(QThread):
     log_message = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, ffmpeg_cmd_list, output_path, total_frames):
+    def __init__(self, ffmpeg_cmd_list, output_path, total_frames, is_verbose_logging): # Add new param
         super().__init__()
         self.ffmpeg_cmd_list = [str(arg) for arg in ffmpeg_cmd_list]
         self.output_path = output_path
         self.total_frames = total_frames
         self.process = None
+        self._is_cancelled = False # New flag
+        self.is_verbose_logging = is_verbose_logging # Store it
 
-    def run(self):  # Using the more complete version of run_ffmpeg_command logic
+    def cancel_task(self):
+        self.log_message.emit(f"Cancellation requested for: {self.output_path.name}")
+        self._is_cancelled = True
+        if self.process and self.process.poll() is None: # If process is running
+            try:
+                self.log_message.emit(f"Terminating FFmpeg process for {self.output_path.name}...")
+                self.process.terminate() # Try to terminate gracefully
+                # Wait a short moment for terminate to take effect
+                try:
+                    self.process.wait(timeout=2) # Wait up to 2 seconds
+                except subprocess.TimeoutExpired:
+                    self.log_message.emit(f"FFmpeg process for {self.output_path.name} did not terminate gracefully, killing...")
+                    self.process.kill() # Force kill if terminate didn't work
+                self.log_message.emit(f"FFmpeg process for {self.output_path.name} termination attempt complete.")
+            except Exception as e:
+                self.log_message.emit(f"Error during FFmpeg process termination: {e}")
+        # The run loop will also check _is_cancelled
+
+    def run(self):
         self.log_message.emit(f"Starting FFmpeg for: {self.output_path.name} ({self.total_frames} frames)")
-        # For debugging the command:
-        # self.log_message.emit(f"  CMD: {' '.join(shlex.quote(str(arg)) for arg in self.ffmpeg_cmd_list)}")
 
-        progress_arg = "-progress"
+        progress_arg = "-progress";
         progress_pipe = "pipe:1"
+        str_ffmpeg_cmd_list = [str(arg) for arg in self.ffmpeg_cmd_list]
         ffmpeg_cmd_with_progress = []
         try:
-            i_index = self.ffmpeg_cmd_list.index('-i')
-            ffmpeg_cmd_with_progress = self.ffmpeg_cmd_list[:i_index] + [progress_arg,
-                                                                         progress_pipe] + self.ffmpeg_cmd_list[i_index:]
+            i_index = str_ffmpeg_cmd_list.index('-i')
+            ffmpeg_cmd_with_progress = str_ffmpeg_cmd_list[:i_index] + [progress_arg,
+                                                                        progress_pipe] + str_ffmpeg_cmd_list[i_index:]
         except ValueError:
-            ffmpeg_cmd_with_progress = [self.ffmpeg_cmd_list[0], progress_arg, progress_pipe] + self.ffmpeg_cmd_list[1:]
-            self.log_message.emit(
-                "Warning: Could not reliably place -progress option using -i; attempting fallback placement.")
+            ffmpeg_cmd_with_progress = [str_ffmpeg_cmd_list[0], progress_arg, progress_pipe] + str_ffmpeg_cmd_list[1:]
+            self.log_message.emit("Warning: Could not reliably place -progress option using -i; attempting fallback.")
 
+        self.log_message.emit(
+            f"  Executing FFmpeg: {' '.join(shlex.quote(arg) for arg in ffmpeg_cmd_with_progress)}")  # Log the actual command
+
+        self.process = None
         try:
             creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             self.process = subprocess.Popen(
@@ -75,10 +100,32 @@ class FFmpegWorker(QThread):
                 text=True, bufsize=1, universal_newlines=True,
                 creationflags=creation_flags
             )
-            while True:
-                if self.process.stdout is None: break
-                line = self.process.stdout.readline()
-                if not line and self.process.poll() is not None: break
+
+            if self.process.stdout is None:
+                self.log_message.emit("Error: FFmpeg stdout pipe is None. Cannot read progress.")
+                self.finished.emit(False, f"{str(self.output_path)} (Pipe Error)")
+                return
+
+            # Progress reading loop
+            while self.process.poll() is None:  # Loop while process is running
+                if self._is_cancelled:
+                    self.log_message.emit(f"Cancellation signal received for {self.output_path.name}.")
+                    break
+
+                    # Try to read a line, but don't block indefinitely if Popen/pipe has issues.
+                # This part is tricky without true non-blocking reads or select.
+                # For now, readline() is standard. If it hangs, FFmpeg is not sending newlines or closing stdout.
+                try:
+                    line = self.process.stdout.readline()  # This is the primary suspect for hangs
+                    if not line:  # Empty line can mean EOF if process also ended
+                        if self.process.poll() is not None:
+                            break  # Break if process ended
+                        else:
+                            time.sleep(0.05); continue  # Process alive, but no data yet, short sleep
+                except Exception as e_readline:
+                    self.log_message.emit(f"Error reading FFmpeg stdout line: {e_readline}")
+                    break  # Exit progress loop on read error
+
                 if line:
                     line = line.strip()
                     if '=' in line:
@@ -90,40 +137,51 @@ class FFmpegWorker(QThread):
                                 self.progress_update.emit(int(value), self.total_frames)
                             elif key == "progress" and value == "end":
                                 self.progress_update.emit(self.total_frames, self.total_frames)
-                                break
+                                break  # Break from progress loop
                         except ValueError:
-                            self.log_message.emit(f"Warning: Could not parse progress line: {line}")
-                        except Exception as e_parse:
-                            self.log_message.emit(f"Warning: Error parsing progress line '{line}': {e_parse}")
+                            self.log_message.emit(f"Warning: Could not parse progress: {line}")
 
-            stdout_final, stderr_final = self.process.communicate(timeout=120)  # Increased timeout further
+            # After loop, ensure cancellation is handled
+            if self._is_cancelled:
+                if self.process and self.process.poll() is None:  # If still running
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                self.log_message.emit(f"Task {self.output_path.name} confirmed cancelled.")
+                self.finished.emit(False, f"{str(self.output_path)} (Cancelled)")
+                return
 
-            if self.process.returncode == 0:
+            # Process finished normally or broke from progress=end
+            # Wait for full termination and get remaining output
+            stdout_final, stderr_final = self.process.communicate(timeout=120)
+
+            if self.process.returncode == 0: # SUCCESS
                 self.log_message.emit(f"Successfully created: {str(self.output_path)}")
-                if stderr_final and stderr_final.strip() and "deprecated pixel format" not in stderr_final.lower():  # Log significant stderr
-                    self.log_message.emit(f"FFmpeg messages for {self.output_path.name}:\n{stderr_final.strip()}")
+                if self.is_verbose_logging:
+                    if stderr_final and stderr_final.strip(): # Only log if there's actual stderr content
+                        self.log_message.emit(f"FFmpeg messages for {self.output_path.name} (verbose):\n{stderr_final.strip()}")
+                # else: (if not verbose on success) do not log stderr_final
                 self.finished.emit(True, str(self.output_path))
-            else:
-                self.log_message.emit(
-                    f"ERROR: FFmpeg command failed for {self.output_path} (exit code {self.process.returncode})")
-                if stderr_final: self.log_message.emit(f"FFmpeg stderr:\n{stderr_final.strip()}")
+            else: # FAILURE
+                self.log_message.emit(f"ERROR: FFmpeg command failed for {self.output_path} (exit code {self.process.returncode})")
+                # Always log full stderr on actual FFmpeg error, regardless of verbose setting, as it's crucial for debugging.
+                if stderr_final and stderr_final.strip():
+                    self.log_message.emit(f"FFmpeg stderr:\n{stderr_final.strip()}")
+                else:
+                    self.log_message.emit("FFmpeg stderr: (No further error output from FFmpeg)") # If stderr was empty
                 self.finished.emit(False, str(self.output_path))
-        except FileNotFoundError:
-            self.log_message.emit("Error: ffmpeg command not found. Is FFmpeg installed and in your PATH?")
-            self.finished.emit(False, str(self.output_path))
-        except subprocess.TimeoutExpired:
-            self.log_message.emit(f"Error: FFmpeg command timed out for {self.output_path}")
-            if self.process and self.process.poll() is None: self.process.kill(); self.process.communicate()
-            self.finished.emit(False, str(self.output_path))
-        except Exception as e:
-            self.log_message.emit(f"Critical error in FFmpeg worker thread for {self.output_path}: {e}")
-            self.finished.emit(False, str(self.output_path))
+
+        # ... (except FileNotFoundError, subprocess.TimeoutExpired, Exception as e) ...
+        # Ensure these except blocks also emit self.finished(False, ...)
+
         finally:
             if self.process and self.process.poll() is None:
-                self.log_message.emit(f"Ensuring FFmpeg process termination for {self.output_path.name}...")
+                self.log_message.emit(
+                    f"Ensuring FFmpeg process termination for {self.output_path.name} (in finally)...")
                 self.process.kill();
                 self.process.communicate()
-
 
 class TimelapseApp(QWidget):
     def __init__(self):
@@ -188,6 +246,8 @@ class TimelapseApp(QWidget):
             "original": {"desc": "Original (no scaling)", "filter": ""},
             "percentage": {"desc": "Percentage of original",
                            "filter_template": "scale=w=trunc(iw*{val}/100/2)*2:h=-2:flags=lanczos"},
+            "6K": {"desc": "6k (6016xH)", "filter": "scale=6016:-2:flags=lanczos"},
+            "4K": {"desc": "4k (3840xH)", "filter": "scale=3840:-2:flags=lanczos"},
             "1080p": {"desc": "1080p (1920xH)", "filter": "scale=1920:-2:flags=lanczos"},
             "720p": {"desc": "720p (1280xH)", "filter": "scale=1280:-2:flags=lanczos"},
             "custom": {"desc": "Custom WxH", "filter_template": "scale={w}:{h}:flags=lanczos"}
@@ -196,26 +256,42 @@ class TimelapseApp(QWidget):
         self.presets_dir.mkdir(parents=True, exist_ok=True)
         self.settings = QSettings("My Timelapse App", "TimelapseMakerGUI")  # More specific org/app names
         self.current_theme = self.settings.value("theme", "light", type=str)  # Specify type for QSettings
+        self.cpu_plot_widget = None
+        self.cpu_plot_data_line = None
+        self.log_text_edit = None
+        self.theme_toggle_button = None # Ensure it's defined before apply_theme is called if init_ui is separate
+
+        self.active_ffmpeg_worker = None # To keep track of the currently running FFmpeg task
+        self.batch_cancelled_flag = False # Flag to stop processing further items in batch
 
         self.init_ui()
 
         self.ffmpeg_workers = []
-        self.dirs_for_current_batch = []
-        self.current_batch_dir_index = 0
+        self.sequences_queue_for_batch = []
+        self.current_batch_sequence_index = 0
         self.current_batch_sequence_generator = None
         self.processed_sequences_in_batch_count = 0  # For overall progress
+        self.gpu_type_detected = None  # Store detected GPU type
+        self.init_monitoring_data_and_start() # Initialize monitoring components
 
     def init_ui(self):
         main_layout = QVBoxLayout()
 
-        top_bar_layout = QHBoxLayout()
-        top_bar_layout.addStretch()
-        self.theme_toggle_button = QPushButton("Switch to Dark Mode")
-        self.theme_toggle_button.setCheckable(True)
-        self.theme_toggle_button.clicked.connect(self.toggle_theme)
-        top_bar_layout.addWidget(self.theme_toggle_button)
+        # --- Top Bar with Theme Toggle ---
+        top_bar_layout = QHBoxLayout();
+
+        self.about_button = QPushButton("About") # Create About button
+        self.about_button.setToolTip("Show application information") # Optional tooltip
+        self.about_button.clicked.connect(self.show_about_dialog) # Connect to slot
+        top_bar_layout.addWidget(self.about_button) # Add to left
+        top_bar_layout.addStretch();
+        self.theme_toggle_button = QPushButton("Switch to Dark Mode");
+        self.theme_toggle_button.setCheckable(True);
+        self.theme_toggle_button.clicked.connect(self.toggle_theme);
+        top_bar_layout.addWidget(self.theme_toggle_button);
         main_layout.addLayout(top_bar_layout)
 
+        # --- Directory Group ---
         dir_group = QGroupBox("Input / Output Directories");
         dir_layout = QGridLayout();
         dir_layout.addWidget(QLabel("Parent Timelapse Directory:"), 0, 0);
@@ -233,6 +309,7 @@ class TimelapseApp(QWidget):
         dir_group.setLayout(dir_layout);
         main_layout.addWidget(dir_group)
 
+        # --- Filename Group ---
         filename_group = QGroupBox("Filename & Sequence Detection");
         filename_layout = QGridLayout();
         filename_layout.addWidget(QLabel("Filename Prefix:"), 0, 0);
@@ -248,6 +325,7 @@ class TimelapseApp(QWidget):
         filename_group.setLayout(filename_layout);
         main_layout.addWidget(filename_group)
 
+        # --- Core Settings Group ---
         core_settings_group = QGroupBox("Core Timelapse Settings");
         core_settings_layout = QHBoxLayout();
         self.input_fps_spin = QDoubleSpinBox();
@@ -266,6 +344,7 @@ class TimelapseApp(QWidget):
         core_settings_group.setLayout(core_settings_layout);
         main_layout.addWidget(core_settings_group)
 
+        # --- Encoding and Scaling Groups ---
         encoding_group = QGroupBox("Encoding Settings");
         encoding_layout = QGridLayout();
         self.hw_accel_label = QLabel("Hardware Acceleration:");
@@ -294,7 +373,6 @@ class TimelapseApp(QWidget):
         self.hw_accel_combo.currentIndexChanged.connect(self.update_dynamic_codec_options_ui);
         encoding_group.setLayout(encoding_layout);
         main_layout.addWidget(encoding_group)
-
         scaling_group = QGroupBox("Resolution Scaling");
         scaling_layout = QHBoxLayout();
         self.scale_type_combo = QComboBox()
@@ -319,29 +397,84 @@ class TimelapseApp(QWidget):
         scaling_group.setLayout(scaling_layout);
         main_layout.addWidget(scaling_group)
 
-        # --- Preset Buttons ---
-        preset_layout = QHBoxLayout()  # Define preset_layout before using it
+        # --- Preset and Action Button Groups ---
+        preset_layout = QHBoxLayout();
         self.load_preset_button = QPushButton("Load Preset");
-        self.load_preset_button.clicked.connect(self.load_preset_action)
+        self.load_preset_button.clicked.connect(self.load_preset_action);
         self.save_preset_button = QPushButton("Save Settings as Preset");
-        self.save_preset_button.clicked.connect(self.save_preset_action)
+        self.save_preset_button.clicked.connect(self.save_preset_action);
         preset_layout.addWidget(self.load_preset_button);
-        preset_layout.addWidget(self.save_preset_button)
-        main_layout.addLayout(preset_layout)  # Now add it
-
-        action_layout = QHBoxLayout();
+        preset_layout.addWidget(self.save_preset_button);
+        main_layout.addLayout(preset_layout)
+        action_and_cancel_layout = QHBoxLayout();
         self.scan_button = QPushButton("Scan for Sequences");
         self.scan_button.clicked.connect(self.scan_directories_action);
+        self.scan_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed);
+        action_and_cancel_layout.addWidget(self.scan_button);
         self.start_button = QPushButton("Start Batch Processing");
         self.start_button.setEnabled(False);
         self.start_button.clicked.connect(self.start_batch_action);
-        action_layout.addWidget(self.scan_button);
-        action_layout.addWidget(self.start_button);
-        main_layout.addLayout(action_layout)
-        main_layout.addWidget(QLabel("Found Sequence Directories / Sequences:"));
-        self.dir_tree_widget = QTreeWidget()  # Changed from QListWidget
-        self.dir_tree_widget.setHeaderLabels(["Directory / Sequence", "Frames (approx)"])
-        main_layout.addWidget(self.dir_tree_widget)
+        self.start_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed);
+        action_and_cancel_layout.addWidget(self.start_button);
+        action_and_cancel_layout.addStretch();
+        self.cancel_current_button = QPushButton("Cancel Current Sequence");
+        self.cancel_current_button.clicked.connect(self.cancel_current_action);
+        self.cancel_current_button.setEnabled(False);
+        self.cancel_current_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed);
+        action_and_cancel_layout.addWidget(self.cancel_current_button);
+        self.cancel_batch_button = QPushButton("Cancel Entire Batch");
+        self.cancel_batch_button.clicked.connect(self.cancel_batch_action);
+        self.cancel_batch_button.setEnabled(False);
+        self.cancel_batch_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed);
+        action_and_cancel_layout.addWidget(self.cancel_batch_button);
+        main_layout.addLayout(action_and_cancel_layout)
+
+        # --- Verbose Log Checkbox ---
+        log_options_layout = QHBoxLayout();
+        self.verbose_log_checkbox = QCheckBox("Enable Verbose FFmpeg Logging");
+        self.verbose_log_checkbox.setChecked(False);
+        log_options_layout.addWidget(self.verbose_log_checkbox);
+        log_options_layout.addStretch();
+        main_layout.addLayout(log_options_layout)
+
+        # --- Create a QSplitter for the main display areas ---
+        splitter = QSplitter(Qt.Orientation.Vertical)
+
+        # Create a container for the tree and its label
+        tree_container_widget = QWidget()
+        tree_layout = QVBoxLayout(tree_container_widget)
+        tree_layout.setContentsMargins(0, 0, 0, 0)
+        tree_layout.addWidget(QLabel("Found Sequence Directories / Sequences:"))
+        self.dir_tree_widget = QTreeWidget()
+        self.dir_tree_widget.setHeaderLabels(["Directory / Sequence", "Frames"])
+        self.dir_tree_widget.itemChanged.connect(self.handle_tree_item_changed)
+        # Make the first column (Directory/Sequence Name) stretch
+        self.dir_tree_widget.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # Give the second column (Frames) a fixed or interactive size initially
+        self.dir_tree_widget.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        tree_layout.addWidget(self.dir_tree_widget)
+
+        # Create a container for the log and its label
+        log_container_widget = QWidget()
+        log_layout = QVBoxLayout(log_container_widget)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(QLabel("Log:"))
+        self.log_text_edit = QTextEdit()
+        self.log_text_edit.setReadOnly(True)
+        log_layout.addWidget(self.log_text_edit)
+
+        # Set a minimum height for the log area
+        tree_container_widget.setMinimumHeight(150)
+        log_container_widget.setMinimumHeight(100)
+
+        splitter.addWidget(tree_container_widget)
+        splitter.addWidget(log_container_widget)
+        splitter.setSizes([600, 300])
+
+        # Add the splitter to the main layout
+        main_layout.addWidget(splitter, 1)
+
+        # --- Add Progress Bars AFTER the splitter ---
         self.current_sequence_progress_bar = QProgressBar();
         self.current_sequence_progress_bar.setTextVisible(True);
         main_layout.addWidget(QLabel("Current Sequence Progress:"));
@@ -350,15 +483,159 @@ class TimelapseApp(QWidget):
         self.overall_batch_progress_bar.setTextVisible(True);
         main_layout.addWidget(QLabel("Overall Batch Progress:"));
         main_layout.addWidget(self.overall_batch_progress_bar)
-        main_layout.addWidget(QLabel("Log:"));
-        self.log_text_edit = QTextEdit();
-        self.log_text_edit.setReadOnly(True);
-        main_layout.addWidget(self.log_text_edit)
+
+        # --- System Monitor Group ---
+        monitor_group = QGroupBox("System Activity Monitor")
+        monitor_layout = QVBoxLayout()
+        # You need to import pyqtgraph as pg at the top of the file
+        self.cpu_plot_widget = pg.PlotWidget(title="CPU Usage (%)")
+        self.cpu_plot_widget.setYRange(0, 100, padding=0.05)
+        self.cpu_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.cpu_plot_widget.getPlotItem().hideAxis('bottom')
+        self.cpu_plot_data_line = self.cpu_plot_widget.plot(pen='c', name="CPU")
+        monitor_layout.addWidget(self.cpu_plot_widget)
+
+        self.mem_plot_widget = pg.PlotWidget(title="Memory Usage (%)")
+        self.mem_plot_widget.setYRange(0, 100, padding=0.05)
+        self.mem_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.mem_plot_widget.getPlotItem().hideAxis('bottom')
+        self.mem_plot_data_line = self.mem_plot_widget.plot(pen='m', name="Memory")
+        monitor_layout.addWidget(self.mem_plot_widget)
+
+        self.gpu_plot_widget = pg.PlotWidget(title="GPU Usage (%) (If available)")
+        self.gpu_plot_widget.setYRange(0, 100, padding=0.05)
+        self.gpu_plot_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.gpu_plot_widget.getPlotItem().hideAxis('bottom')
+        self.gpu_plot_data_line = self.gpu_plot_widget.plot(pen='y', name="GPU")
+        self.gpu_plot_widget.setVisible(False)  # Hide initially
+        monitor_layout.addWidget(self.gpu_plot_widget)
+
+        monitor_group.setLayout(monitor_layout)
+        main_layout.addWidget(monitor_group)
 
         self.setLayout(main_layout)
+
+        # --- Final UI state updates ---
         self.update_scaling_options_ui()
         self.update_dynamic_codec_options_ui()
         self.apply_theme(self.current_theme)
+
+    def show_about_dialog(self):
+        # If using the custom AboutDialog:
+        dialog = AboutDialog(self) # Pass parent
+        dialog.exec() # Show as a modal dialog
+
+    def handle_tree_item_changed(self, item: QTreeWidgetItem, column: int):
+        if column == 0:  # Only act on changes in the first column (where checkboxes are)
+            # Block signals to prevent recursive calls while we programmatically change states
+            self.dir_tree_widget.blockSignals(True)
+
+            current_check_state = item.checkState(0)
+
+            # --- Case 1: A PARENT item's check state was changed by the user ---
+            if item.parent() is None:  # This is a top-level (parent) item
+                # If parent is checked or unchecked by user, propagate to all children
+                if current_check_state == Qt.CheckState.Checked or current_check_state == Qt.CheckState.Unchecked:
+                    for i in range(item.childCount()):
+                        child = item.child(i)
+                        if child.flags() & Qt.ItemFlag.ItemIsUserCheckable:  # Only if child is checkable
+                            child.setCheckState(0, current_check_state)
+                # Note: A parent item usually won't be set to PartiallyChecked by direct user click
+                # if ItemIsAutoTristate is working correctly with its children.
+                # If a parent IS partially checked, we don't automatically propagate that to children.
+
+            # --- Case 2: A CHILD item's check state was changed by the user ---
+            else:
+                parent = item.parent()
+                if parent:  # Should always have a parent if it's a child
+                    num_children = parent.childCount()
+                    checked_children_count = 0
+                    unchecked_children_count = 0
+
+                    for i in range(num_children):
+                        child = parent.child(i)
+                        if child.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                            if child.checkState(0) == Qt.CheckState.Checked:
+                                checked_children_count += 1
+                            elif child.checkState(0) == Qt.CheckState.Unchecked:
+                                unchecked_children_count += 1
+
+                    if checked_children_count == num_children:
+                        # All children are checked, so parent becomes fully checked
+                        parent.setCheckState(0, Qt.CheckState.Checked)
+                    elif unchecked_children_count == num_children:
+                        # All children are unchecked, so parent becomes fully unchecked
+                        parent.setCheckState(0, Qt.CheckState.Unchecked)
+                    else:
+                        # Some are checked, some are not (or some are partially checked themselves if they were parents)
+                        # So, parent becomes partially checked
+                        parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+
+            # Re-enable signals
+            self.dir_tree_widget.blockSignals(False)
+
+    def init_monitoring_data_and_start(self):  # RENAMED and MODIFIED
+        self.cpu_data_history = [0] * 60  # Or a different history length
+        self.mem_data_history = [0] * 60
+        self.gpu_data_history = [0] * 60
+
+        self.monitor_timer = QTimer(self)
+        self.monitor_timer.timeout.connect(self.update_monitors_display)
+
+        self.check_gpu_availability_and_setup_plot()  # Sets up the GPU plot visibility
+
+        self.monitor_timer.start(1000)  # START THE TIMER HERE (e.g., update every 1 second)
+        self.log("System monitoring started.")
+
+    # check_gpu_availability_and_setup_plot remains the same
+    # update_monitors_display remains the same
+
+    def check_gpu_availability_and_setup_plot(self): # Renamed and modified
+        self.gpu_type_detected = monitoring_engine.detect_gpu_type() # Call engine
+        if self.gpu_type_detected:
+            self.gpu_plot_widget.setVisible(True)
+            self.gpu_plot_widget.setTitle(f"{self.gpu_type_detected.upper()} GPU Usage (%)")
+            self.log(f"{self.gpu_type_detected.upper()} GPU detected. Monitoring enabled.")
+        else:
+            self.gpu_plot_widget.setVisible(False)
+            self.log("No common GPU monitoring tool found or supported for detailed stats by engine.")
+
+    def update_monitors_display(self): # Renamed from update_monitors
+        cpu_usage = monitoring_engine.get_cpu_usage()
+        if cpu_usage is not None:
+            self.cpu_data_history.pop(0); self.cpu_data_history.append(cpu_usage)
+            self.cpu_plot_data_line.setData(self.cpu_data_history)
+
+        mem_usage = monitoring_engine.get_memory_usage()
+        if mem_usage is not None:
+            self.mem_data_history.pop(0); self.mem_data_history.append(mem_usage)
+            self.mem_plot_data_line.setData(self.mem_data_history)
+
+        if self.gpu_type_detected:
+            # get_gpu_usage now returns type and util, but we already have type
+            _, gpu_util = monitoring_engine.get_gpu_usage() # Engine handles which specific util func to call
+            if gpu_util is not None:
+                self.gpu_data_history.pop(0); self.gpu_data_history.append(gpu_util)
+            else: # Error or no data for this tick
+                self.gpu_data_history.pop(0); self.gpu_data_history.append(0) # Append 0
+            self.gpu_plot_data_line.setData(self.gpu_data_history)
+
+    def cancel_current_action(self):
+        if self.active_ffmpeg_worker and self.active_ffmpeg_worker.isRunning():
+            self.log("Sending cancel signal to current FFmpeg task...")
+            self.active_ffmpeg_worker.cancel_task()
+        else:
+            self.log("No FFmpeg task currently running to cancel.")
+
+    def cancel_batch_action(self):  # <<< THIS IS THE METHOD
+        self.log("Batch cancellation requested...")
+        self.batch_cancelled_flag = True
+        self.cancel_current_action()  # Attempt to cancel current task as well
+        # UI updates to reflect cancellation state
+        self.start_button.setEnabled(False)  # Can't restart a cancelled batch easily this way
+        self.cancel_batch_button.setEnabled(False)  # Batch cancel is now in effect
+        self.cancel_current_button.setEnabled(False)  # Current task is being cancelled
+        self.log("Batch processing will stop. Any running sequence is being cancelled.")
 
     def apply_theme(self, theme_name: str):
         if theme_name == "dark":
@@ -691,186 +968,314 @@ class TimelapseApp(QWidget):
             except Exception as e:
                 self.log(f"Error loading preset: {e}")
 
-    def scan_directories_action(self):  # Modified for QTreeWidget
+    def scan_directories_action(self):
         self.log("Scanning for sequence directories...")
-        parent_dir = Path(self.parent_dir_edit.text())
+        parent_dir_ui = Path(self.parent_dir_edit.text())
         current_prefix = self.filename_prefix_edit.text() or ENGINE_DEFAULT_FILENAME_PREFIX
         current_suffix = self.filename_suffix_edit.text() or ENGINE_DEFAULT_FILENAME_SUFFIX
 
-        self.dir_tree_widget.clear()  # Use tree widget
-        self.dirs_to_process_cache = find_potential_sequence_dirs(parent_dir, current_prefix, current_suffix)
+        self.dir_tree_widget.clear()
+        self.dirs_to_process_cache = find_potential_sequence_dirs(parent_dir_ui, current_prefix, current_suffix)
 
-        if self.dirs_to_process_cache:
-            for parent_dir_path in self.dirs_to_process_cache:
-                parent_item = QTreeWidgetItem(self.dir_tree_widget, [str(parent_dir_path.name)])
-                parent_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "parent_dir", "path": parent_dir_path})
-                parent_item.setFlags(parent_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                parent_item.setCheckState(0, Qt.CheckState.Checked)  # Auto-check parent
-
-                # Mock generating sequence items; in real use, call engine to find sequences within parent_dir_path
-                # sequences_info = get_sequence_details_for_directory(parent_dir_path, current_prefix, current_suffix)
-                # For now, let's assume generate_ffmpeg_commands_for_sequences_in_dir can be used for this
-                # This is a bit inefficient for just listing but will work for now.
-                # A dedicated engine function would be better.
-                temp_settings_for_scan = self.gather_common_settings_from_ui()  # Need some settings for the generator
-                if not temp_settings_for_scan: temp_settings_for_scan = {}  # Fallback
-
-                try:
-                    for _, output_p, frames in generate_ffmpeg_commands_for_sequences_in_dir(parent_dir_path,
-                                                                                             current_prefix,
-                                                                                             current_suffix,
-                                                                                             temp_settings_for_scan):
-                        # Extract sequence start number from a dummy output_path for display
-                        seq_start_num_match = re.search(r"seq(\d+)", output_p.name)
-                        seq_start_display = seq_start_num_match.group(1) if seq_start_num_match else "UnknownSeq"
-
-                        child_item = QTreeWidgetItem(parent_item,
-                                                     [f"  Sequence starting ~{seq_start_display}", str(frames)])
-                        # Store enough info to re-identify this exact sequence for processing
-                        child_item.setData(0, Qt.ItemDataRole.UserRole, {
-                            "type": "sequence",
-                            "parent_path": parent_dir_path,
-                            "start_number_str": seq_start_display,  # This is an approx for display
-                            "num_frames": frames,
-                            # "image_pattern": ... # The engine will re-determine this
-                        })
-                        child_item.setFlags(child_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                        child_item.setCheckState(0, Qt.CheckState.Checked)
-                except Exception as e:
-                    self.log(f"Error scanning sequences in {parent_dir_path}: {e}")
-                parent_item.setExpanded(True)
-            self.log(f"Found {len(self.dirs_to_process_cache)} potential directory(s) with sequences.")
-            self.start_button.setEnabled(True)
-        else:
-            self.log(f"No sequence directories found in '{parent_dir}'."); self.start_button.setEnabled(False)
-
-    def start_batch_action(self):  # Modified for QTreeWidget
-        self.log(f"Start batch action triggered.")
-        self.dirs_for_current_batch_and_seqs = []  # List of dicts {"type": "sequence", "parent_path": ..., "start_number_str": ...}
-
-        root = self.dir_tree_widget.invisibleRootItem()
-        for i in range(root.childCount()):
-            parent_item = root.child(i)
-            if parent_item.checkState(0) == Qt.CheckState.Checked:  # If parent dir is checked
-                parent_path = parent_item.data(0, Qt.ItemDataRole.UserRole)["path"]
-                # If processing parent, assume all its children (sequences) are processed
-                # OR allow individual sequence selection
-                has_selected_child = False
-                for j in range(parent_item.childCount()):
-                    child_item = parent_item.child(j)
-                    if child_item.checkState(0) == Qt.CheckState.Checked:
-                        seq_data = child_item.data(0, Qt.ItemDataRole.UserRole)
-                        # Ensure seq_data is the expected dictionary
-                        if isinstance(seq_data, dict) and seq_data.get("type") == "sequence":
-                            self.dirs_for_current_batch_and_seqs.append(seq_data)
-                            has_selected_child = True
-
-                # If parent is checked but no children, maybe log or decide if it means "process all under parent"
-                if not has_selected_child and parent_item.childCount() > 0:
-                    self.log(
-                        f"Parent '{parent_path.name}' checked, but no individual sequences selected under it. Assuming all sequences if any exist.")
-                    # Here you might re-run a lightweight scan for this parent_path to add all its sequences
-                    # For now, this implies it will be skipped if no children are explicitly checked.
-
-        if not self.dirs_for_current_batch_and_seqs:
-            self.log("No sequences selected or found to process.");
+        if not self.dirs_to_process_cache:
+            self.log(
+                f"No potential sequence subdirectories found in '{parent_dir_ui}' matching prefix='{current_prefix}', suffix='{current_suffix}'.")
+            self.start_button.setEnabled(False)
             return
-
-        self.log(f"Processing {len(self.dirs_for_current_batch_and_seqs)} selected sequence(s)...")
-        self.start_button.setEnabled(False);
-        self.scan_button.setEnabled(False)
-
-        self.common_settings_for_batch = self.gather_common_settings_from_ui()
-        if not self.common_settings_for_batch:
-            self.log("Failed to gather settings.");
-            self.start_button.setEnabled(True);
-            self.scan_button.setEnabled(True);
-            return
-
-        self.current_batch_dir_index = 0  # This will now be index for dirs_for_current_batch_and_seqs
-        self.current_batch_sequence_generator = None  # Not used in same way
-        self.processed_sequences_in_batch_count = 0
-        self.overall_batch_progress_bar.setMaximum(len(self.dirs_for_current_batch_and_seqs))
-        self.overall_batch_progress_bar.setValue(0)
-        self.overall_batch_progress_bar.setFormat("Overall Sequences: %v/%m")
-        self.process_next_individual_sequence()
-
-    def process_next_individual_sequence(self):  # New function to handle one sequence at a time
-        if self.current_batch_dir_index >= len(self.dirs_for_current_batch_and_seqs):
-            self.log("===== Batch processing fully completed. =====")
-            self.scan_button.setEnabled(True);
-            self.start_button.setEnabled(True if self.dir_tree_widget.topLevelItemCount() > 0 else False)
-            self.overall_batch_progress_bar.setFormat("Batch Complete!");
-            self.overall_batch_progress_bar.setValue(self.overall_batch_progress_bar.maximum())
-            return
-
-        sequence_data = self.dirs_for_current_batch_and_seqs[self.current_batch_dir_index]
-        parent_dir = sequence_data["parent_path"]
-        # The engine's generate_ffmpeg_commands will re-find the specific sequence based on start_num
-        # For this, we need to ensure the engine's generator can find a *specific* sequence
-        # or we pass all necessary info.
-        # Let's assume generate_ffmpeg_commands_for_sequences_in_dir will find this one among others
-        # if it's the first unprocessed one matching. This needs careful handling in the engine.
 
         self.log(
-            f"--- Preparing sequence starting ~{sequence_data['start_number_str']} in {parent_dir.name} ({self.current_batch_dir_index + 1}/{len(self.dirs_for_current_batch_and_seqs)}) ---")
+            f"Found {len(self.dirs_to_process_cache)} potential directory(s). Now scanning for sequences within them...")
 
-        # We need to get the *specific* command for *this* sequence.
-        # The current generate_ffmpeg_commands_for_sequences_in_dir yields all in a directory.
-        # This requires a refactor of how sequences are picked for processing.
-        # Quick hack for now: iterate the generator and pick the one matching start_number_str
-        # This is INEFFICIENT and should be refactored in the engine.
+        temp_settings_for_scan = self.gather_common_settings_from_ui()
+        if not temp_settings_for_scan:
+            self.log("Error: Could not gather current settings for sequence scanning. Using minimal defaults.")
+            temp_settings_for_scan = {
+                "main_output_dir": Path(self.output_dir_edit.text() or DEFAULT_OUTPUT_DIR),
+                "filename_prefix_ui": current_prefix, "filename_suffix_ui": current_suffix,
+                "output_extension": ".mp4", "video_codec": "libx264",
+                "input_fps": DEFAULT_INPUT_FPS, "output_fps": DEFAULT_OUTPUT_FPS
+            }
 
-        ui_prefix = self.common_settings_for_batch.get("filename_prefix_ui", ENGINE_DEFAULT_FILENAME_PREFIX)
-        ui_suffix = self.common_settings_for_batch.get("filename_suffix_ui", ENGINE_DEFAULT_FILENAME_SUFFIX)
+        total_sequences_added_to_tree = 0
+        for parent_dir_path in self.dirs_to_process_cache:
+            parent_item = QTreeWidgetItem(self.dir_tree_widget, [str(parent_dir_path.name)])
+            parent_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "parent_dir", "path": parent_dir_path})
+            parent_item.setFlags(
+                parent_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)  # Removed ItemIsAutoTristate for now
+            parent_item.setCheckState(0, Qt.CheckState.Checked)  # <<<<<< CHANGED TO CHECKED BY DEFAULT
 
-        cmd_to_run, path_to_run, frames_to_run = None, None, None
-        # This is a temporary workaround for selecting a specific sequence.
-        # The engine should ideally have a way to get params for ONE specific sequence.
-        temp_sequence_gen = generate_ffmpeg_commands_for_sequences_in_dir(parent_dir, ui_prefix, ui_suffix,
-                                                                          self.common_settings_for_batch)
-        for ffmpeg_cmd, output_path, total_frames in temp_sequence_gen:
-            # Check if this is the sequence we want (this matching is simplistic)
-            if f"seq{sequence_data['start_number_str']}" in output_path.name:
-                cmd_to_run, path_to_run, frames_to_run = ffmpeg_cmd, output_path, total_frames
-                break
+            sequences_found_in_this_parent = 0
+            try:
+                for _, output_p, frames in generate_ffmpeg_commands_for_sequences_in_dir(
+                        parent_dir_path, current_prefix, current_suffix, temp_settings_for_scan):
+                    seq_start_num_match = re.search(r"seq(\d+)", output_p.name)
+                    seq_start_display = seq_start_num_match.group(1) if seq_start_num_match else "UnknownStart"
 
-        if cmd_to_run:
-            self.log(f"  Processing sequence -> {path_to_run.name}")
-            self.current_sequence_progress_bar.setFormat(f"{path_to_run.name} - %p%");
-            self.current_sequence_progress_bar.setValue(0)
-            worker = FFmpegWorker(cmd_to_run, path_to_run, frames_to_run)
-            worker.progress_update.connect(self.update_current_sequence_progress_slot)
-            worker.log_message.connect(self.log);
-            worker.finished.connect(self.on_ffmpeg_worker_finished_slot)
-            self.ffmpeg_workers.append(worker);
-            worker.start()
-        else:
+                    child_item = QTreeWidgetItem(parent_item,
+                                                 [f"  Sequence starting ~{seq_start_display}", str(frames)])
+                    child_item.setData(0, Qt.ItemDataRole.UserRole, {
+                        "type": "sequence", "parent_path": parent_dir_path,
+                        "start_number_str_approx": seq_start_display,
+                        "num_frames_approx": frames
+                    })
+                    child_item.setFlags(child_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    child_item.setCheckState(0, Qt.CheckState.Checked)  # <<<<<< CHANGED TO CHECKED BY DEFAULT
+                    sequences_found_in_this_parent += 1
+                    total_sequences_added_to_tree += 1
+            except Exception as e:
+                self.log(f"Error while scanning sequences in '{parent_dir_path.name}': {e}")
+                error_child = QTreeWidgetItem(parent_item, [f"  (Error scanning: {e})", ""])
+                error_child.setFlags(error_child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+
+            if sequences_found_in_this_parent == 0:
+                no_seq_child = QTreeWidgetItem(parent_item, ["  (No sequences detected with current settings)", ""])
+                no_seq_child.setFlags(no_seq_child.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
+                parent_item.setCheckState(0, Qt.CheckState.Unchecked)  # Uncheck parent if no children
+                parent_item.setDisabled(True)  # Optionally disable parent if no sequences
+
+            parent_item.setExpanded(True)
+
+        if total_sequences_added_to_tree > 0:
             self.log(
-                f"  Could not find/generate command for sequence starting ~{sequence_data['start_number_str']} in {parent_dir}. Skipping.")
-            self.current_batch_dir_index += 1  # Effectively sequence index now
-            self.process_next_individual_sequence()  # Try next
+                f"Scan complete. Displaying {total_sequences_added_to_tree} sequence(s) across {len(self.dirs_to_process_cache)} directory(s).")
+            self.start_button.setEnabled(True)
+        else:
+            self.log("Scan complete. No processable sequences found with current settings.")
+            self.start_button.setEnabled(False)
+
+    def start_batch_action(self):
+        self.log("Start batch action triggered.")
+        self.sequences_queue_for_batch = []  # THIS WILL BE OUR QUEUE of sequence data dicts
+
+        root = self.dir_tree_widget.invisibleRootItem()
+        for i in range(root.childCount()):  # Iterate through parent directory items
+            parent_item = root.child(i)
+            # Iterate through child sequence items of this parent
+            for j in range(parent_item.childCount()):
+                child_item = parent_item.child(j)
+                # We only care if the child (sequence) item itself is checked
+                if child_item.checkState(0) == Qt.CheckState.Checked:
+                    seq_data = child_item.data(0, Qt.ItemDataRole.UserRole)
+                    # Ensure seq_data is the expected dictionary and type
+                    if isinstance(seq_data, dict) and seq_data.get("type") == "sequence":
+                        self.sequences_queue_for_batch.append(seq_data)
+
+        if not self.sequences_queue_for_batch:
+            self.log(
+                "No sequences selected for processing. Please check the boxes next to the individual sequences you want to render.")
+            return  # Correctly exits if nothing is selected
+
+        self.log(f"Starting batch for {len(self.sequences_queue_for_batch)} selected sequence(s)...")
+        self.start_button.setEnabled(False);
+        self.scan_button.setEnabled(False)
+        self.cancel_batch_button.setEnabled(True);
+        self.cancel_current_button.setEnabled(False)
+        self.batch_cancelled_flag = False
+
+        self.common_settings_for_batch = self.gather_common_settings_from_ui()
+        if not self.common_settings_for_batch:  # Checks if gather_settings returned None (or empty dict)
+            self.log("Failed to gather valid settings. Aborting batch.")
+            self.start_button.setEnabled(True);
+            self.scan_button.setEnabled(True);  # Re-enable scan button too
+            self.cancel_batch_button.setEnabled(False)  # Disable cancel if batch aborted
+            return
+
+            # Now we know the exact number of sequences
+            self.current_batch_total_sequences = len(self.sequences_queue_for_batch)
+            self.processed_sequences_in_batch_count = 0
+
+            self.overall_batch_progress_bar.setMaximum(
+                self.current_batch_total_sequences if self.current_batch_total_sequences > 0 else 1)  # Good check
+            self.overall_batch_progress_bar.setValue(0)
+            self.overall_batch_progress_bar.setFormat(
+                f"Overall Sequences: %v/{self.current_batch_total_sequences if self.current_batch_total_sequences > 0 else 'N/A'}")
+
+            # Start the monitor timer if needed
+            if hasattr(self, 'monitor_timer') and not self.monitor_timer.isActive():
+                self.monitor_timer.start(1000)
+                self.log("System monitoring started for batch.")
+
+            # Set the index to the first sequence and kick off the process
+            self.current_batch_sequence_index = 0
+            self.process_next_individual_sequence()  # Correctly calls the simplified processing method
+
+    def process_next_individual_sequence(self):
+            if self.batch_cancelled_flag:
+                self.log("Batch was cancelled. Halting further processing.")
+                self.cleanup_after_batch_or_cancel()
+                return
+
+            # Check if we have processed all items in our queue
+            if self.current_batch_sequence_index >= len(self.sequences_queue_for_batch):
+                self.log("===== Batch processing fully completed. =====")
+                self.cleanup_after_batch_or_cancel()
+                return
+
+            # Get the next specific sequence from our queue
+            sequence_to_process_data = self.sequences_queue_for_batch[self.current_batch_sequence_index]
+
+            parent_dir = sequence_to_process_data["parent_path"]
+            start_num = sequence_to_process_data["start_number_str"]  # This is just for logging/finding
+
+            self.log(
+                f"--- Preparing sequence starting ~{start_num} in {parent_dir.name} ({self.current_batch_sequence_index + 1}/{len(self.sequences_queue_for_batch)}) ---")
+
+            # Now, call the engine generator for this parent directory, but find the specific sequence we want.
+            # This is still inefficient, but it's the bridge to a better engine function later.
+            prefix_to_use = self.common_settings_for_batch.get("filename_prefix_ui", ENGINE_DEFAULT_FILENAME_PREFIX)
+            suffix_to_use = self.common_settings_for_batch.get("filename_suffix_ui", ENGINE_DEFAULT_FILENAME_SUFFIX)
+
+            cmd_to_run, path_to_run, frames_to_run = None, None, None
+
+            # Find the specific command for the sequence we're currently processing from the queue
+            for ffmpeg_cmd, output_path, total_frames in generate_ffmpeg_commands_for_sequences_in_dir(
+                    parent_dir, prefix_to_use, suffix_to_use, self.common_settings_for_batch):
+
+                seq_start_num_match = re.search(r"seq(\d+)", output_path.name)
+                if seq_start_num_match and seq_start_num_match.group(1) == sequence_data[
+                    "start_number_str_approx"]:  # Use the stored approx
+                    cmd_to_run, path_to_run, frames_to_run = ffmpeg_cmd, output_path, total_frames
+                    break
+
+            if cmd_to_run:
+                self.current_sequence_progress_bar.setFormat(f"{path_to_run.name} - %p%")
+                self.current_sequence_progress_bar.setValue(0)
+                self.current_sequence_progress_bar.setMaximum(frames_to_run if frames_to_run > 0 else 100)
+
+                is_verbose = self.verbose_log_checkbox.isChecked()
+                self.active_ffmpeg_worker = FFmpegWorker(cmd_to_run, path_to_run, frames_to_run, is_verbose)
+                self.active_ffmpeg_worker.progress_update.connect(self.update_current_sequence_progress_slot)
+                self.active_ffmpeg_worker.log_message.connect(self.log)
+                self.active_ffmpeg_worker.finished.connect(self.on_ffmpeg_worker_finished_slot)
+
+                self.cancel_current_button.setEnabled(True)
+                self.active_ffmpeg_worker.start()
+            else:
+                # This specific sequence was not found by the engine, maybe files were deleted since scanning.
+                self.log(f"  Could not find/generate command for sequence starting ~{start_num}. Skipping.")
+                # We must still call the 'finished' slot logic to move to the next item
+                self.on_ffmpeg_worker_finished_slot(False, f"Sequence starting {start_num} not found by engine.")
 
     def on_ffmpeg_worker_finished_slot(self, success, output_file_str):
-        if success:
-            self.log(f"  Sequence finished: {output_file_str}")
+        self.active_ffmpeg_worker = None
+        self.cancel_current_button.setEnabled(False)
+
+        if success: self.log(f"  Sequence finished: {output_file_str}")
+        else: self.log(f"  Sequence FAILED or CANCELLED: {output_file_str}")
+
+        if not self.batch_cancelled_flag:
+            self.processed_sequences_in_batch_count += 1
+            if self.overall_batch_progress_bar.maximum() > 0:
+                self.overall_batch_progress_bar.setValue(self.processed_sequences_in_batch_count)
+
+        self.current_batch_sequence_index += 1 # IMPORTANT: Move to the next sequence in our queue
+        self.process_next_individual_sequence() # Trigger processing for the next item
+
+    def cleanup_after_batch_or_cancel(self):
+        """Resets UI elements after batch completion or cancellation."""
+        # if self.monitor_timer.isActive():
+        #   self.monitor_timer.stop()
+        self.scan_button.setEnabled(True)
+        self.start_button.setEnabled(True if self.dir_tree_widget.topLevelItemCount() > 0 else False)
+        self.cancel_batch_button.setEnabled(False)
+        self.cancel_current_button.setEnabled(False)
+        if self.batch_cancelled_flag :
+            self.overall_batch_progress_bar.setFormat("Batch Cancelled")
         else:
-            self.log(f"  Sequence FAILED: {output_file_str}")
-
-        self.processed_sequences_in_batch_count += 1
-        self.overall_batch_progress_bar.setValue(self.processed_sequences_in_batch_count)
-
-        self.current_batch_dir_index += 1  # Move to the next sequence in the list
-        self.process_next_individual_sequence()
+            self.overall_batch_progress_bar.setFormat("Batch Complete!")
+            if self.overall_batch_progress_bar.maximum() > 0 : # Ensure it shows 100% if tasks ran
+                 self.overall_batch_progress_bar.setValue(self.overall_batch_progress_bar.maximum())
+        self.active_ffmpeg_worker = None # Ensure cleared
+        self.batch_cancelled_flag = False # Reset for next run
 
     def update_current_sequence_progress_slot(self, current_frame, total_frames):
-        if self.current_sequence_progress_bar.maximum() != total_frames and total_frames > 0: self.current_sequence_progress_bar.setMaximum(
-            total_frames)
-        if total_frames > 0:
+        if total_frames > 0: # Check total_frames before setting maximum
+            if self.current_sequence_progress_bar.maximum() != total_frames:
+                 self.current_sequence_progress_bar.setMaximum(total_frames)
             self.current_sequence_progress_bar.setValue(current_frame)
-        else:
+        else: # Handle case where total_frames might be 0 (e.g., error or empty sequence)
+            self.current_sequence_progress_bar.setMaximum(100) # Default max
             self.current_sequence_progress_bar.setValue(0)
 
+    def closeEvent(self, event):
+        """Ensure timer is stopped when the application window is closed."""
+        self.log("Application closing, stopping monitor timer...")
+        if hasattr(self, 'monitor_timer') and self.monitor_timer.isActive():
+            self.monitor_timer.stop()
+        # Clean up any running FFmpeg workers if necessary
+        if self.active_ffmpeg_worker and self.active_ffmpeg_worker.isRunning():
+            self.log("Stopping active FFmpeg worker...")
+            self.active_ffmpeg_worker.cancel_task() # Ask it to terminate
+            if not self.active_ffmpeg_worker.wait(3000): # Wait up to 3s
+                 self.log("FFmpeg worker did not terminate gracefully on close.")
+                 # It should be killed by its own finally block or OS
+        super().closeEvent(event) # Important to call the base class method
+
+class AboutDialog(QDialog):  # Import QDialog from PyQt6.QtWidgets
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("About Timelapse Maker")
+
+        layout = QVBoxLayout(self)
+
+        # --- Icon ---
+        icon_label = QLabel()
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)  # Good to keep for centering
+
+        icon_path = Path(__file__).resolve().parent / "icon.png"
+        if icon_path.exists():
+            pixmap = QPixmap(str(icon_path))
+            if not pixmap.isNull():  # Good practice to check if pixmap loaded correctly
+                icon_label.setPixmap(
+                    pixmap.scaled(120, 120,
+                                  Qt.AspectRatioMode.KeepAspectRatio,
+                                  Qt.TransformationMode.SmoothTransformation)
+                )
+            else:
+                icon_label.setText("(Icon Load Error)")  # Fallback if file exists but can't be loaded
+                print(f"Warning: Could not load icon from {icon_path}")  # Log the error
+        else:
+            icon_label.setText("(Icon Not Found)")  # Fallback if file doesn't exist
+            print(f"Warning: Icon file not found at {icon_path}")  # Log the error
+
+        layout.addWidget(icon_label)  # <<<< ENSURE THIS IS CALLED
+
+        # --- Title ---
+        title_label = QLabel("Timelapse Maker GUI")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label.setStyleSheet("font-size: 16pt; font-weight: bold;")
+        layout.addWidget(title_label)
+
+        # --- Version ---
+        version_label = QLabel("Version: 0.4.2 (Python Edition)")  # Update as needed
+        version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(version_label)
+
+        # --- Description ---
+        description_text = (
+            "This application helps create timelapse videos from sequences of images "
+            "using FFmpeg.\n\n"
+            "Developed with Python and PyQt6.\n"
+            "Inspired by your great ideas!"
+        )
+        desc_label = QLabel(description_text)
+        desc_label.setWordWrap(True)
+        desc_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(desc_label)
+
+        layout.addStretch()
+
+        # --- OK Button ---
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(self.accept)  # Closes the dialog
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(ok_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+        self.setMinimumWidth(350)
+        self.setLayout(layout)
 
 def load_stylesheet(app_instance, qss_file_path: Path):
     if qss_file_path.exists():
@@ -879,7 +1284,6 @@ def load_stylesheet(app_instance, qss_file_path: Path):
         print(f"Stylesheet '{qss_file_path.name}' loaded.")
     else:
         print(f"Warning: Stylesheet '{qss_file_path.name}' not found at {qss_file_path}.")
-
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
