@@ -1,4 +1,4 @@
-# Python Timelapse Maker GUI v0.4
+# Python Timelapse Maker GUI v0.4.2
 
 Small application to turn a high-resolution sequence of images into a video file in an easy and practical way using FFmpeg and Python.
 
